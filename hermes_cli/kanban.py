@@ -1,6 +1,6 @@
 """CLI for the Hermes Kanban board — ``hermes kanban …`` subcommand.
 
-Exposes the full 15-verb surface documented in the design spec
+Exposes the full Kanban command surface documented in the design spec
 (``docs/hermes-kanban-v1-spec.pdf``).  All DB work is delegated to
 ``kanban_db``.  This module adds:
 
@@ -36,6 +36,7 @@ _STATUS_ICONS = {
     "todo":     "◻",
     "ready":    "▶",
     "running":  "●",
+    "scheduled":"⏱",
     "blocked":  "⊘",
     "done":     "✓",
     "archived": "—",
@@ -66,6 +67,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
+        "branch_name": t.branch_name,
         "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
@@ -73,12 +75,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
-<<<<<<< HEAD
         "session_id": t.session_id,
-=======
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
->>>>>>> 503702ea9 (kanban: filter tasks by workflow fields and runs by status/outcome)
     }
 
 
@@ -95,23 +94,40 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
 def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
     """Parse ``--workspace`` into ``(kind, path|None)``.
 
-    Accepts: ``scratch``, ``worktree``, ``dir:<path>``.
+    Accepts: ``scratch``, ``worktree``, ``worktree:<path>``, ``dir:<path>``.
     """
     if not value:
         return ("scratch", None)
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
-    if v.startswith("dir:"):
-        path = v[len("dir:"):].strip()
+    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree")):
+        if not v.startswith(prefix):
+            continue
+        path = v[len(prefix):].strip()
         if not path:
             raise argparse.ArgumentTypeError(
-                "--workspace dir: requires a path after the colon"
+                f"--workspace {prefix} requires a path after the colon"
             )
-        return ("dir", os.path.expanduser(path))
+        return (kind, os.path.expanduser(path))
     raise argparse.ArgumentTypeError(
-        f"unknown --workspace value {value!r}: use scratch, worktree, or dir:<path>"
+        f"unknown --workspace value {value!r}: use scratch, worktree, "
+        "worktree:<path>, or dir:<path>"
     )
+
+
+def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
+    """Normalize an optional branch name from ``kanban create --branch``."""
+    if value is None:
+        return None
+    branch = value.strip()
+    if not branch:
+        raise argparse.ArgumentTypeError("--branch requires a non-empty name")
+    if branch.startswith("-"):
+        raise argparse.ArgumentTypeError("--branch must not start with '-'")
+    if any(ch.isspace() for ch in branch):
+        raise argparse.ArgumentTypeError("--branch must not contain whitespace")
+    return branch
 
 
 def _check_dispatcher_presence() -> tuple[bool, str]:
@@ -293,7 +309,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
-                          help="scratch | worktree | dir:<path> (default: scratch)")
+                          help="scratch | worktree | worktree:<path> | dir:<path> "
+                               "(default: scratch)")
+    p_create.add_argument("--branch", default=None,
+                          help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -366,12 +385,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
     p_list.add_argument(
-<<<<<<< HEAD
         "--sort",
         default=None,
         choices=sorted(kb.VALID_SORT_ORDERS.keys()),
         help="Sort order for listed tasks (default: priority)",
-=======
+    )
+    p_list.add_argument(
         "--workflow-template-id",
         default=None,
         metavar="ID",
@@ -383,7 +402,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="current_step_key",
         metavar="KEY",
         help="Restrict to tasks with this current_step_key",
->>>>>>> 503702ea9 (kanban: filter tasks by workflow fields and runs by status/outcome)
     )
 
     # --- show ---
@@ -523,8 +541,47 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
 
-    p_unblock = sub.add_parser("unblock", help="Return one or more blocked tasks to ready")
+    p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
+    p_schedule.add_argument("task_id")
+    p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
+    p_schedule.add_argument("--ids", nargs="+", default=None,
+                            help="Additional task ids to schedule with the same reason (bulk mode)")
+
+    p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_promote = sub.add_parser(
+        "promote",
+        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+    )
+    p_promote.add_argument("task_id")
+    p_promote.add_argument(
+        "reason",
+        nargs="*",
+        help="Audit-trail reason (recorded on the task_events row)",
+    )
+    p_promote.add_argument(
+        "--ids",
+        nargs="+",
+        default=None,
+        help="Additional task ids to promote with the same reason (bulk mode)",
+    )
+    p_promote.add_argument(
+        "--force",
+        action="store_true",
+        help="Promote even if parent dependencies are not yet done/archived",
+    )
+    p_promote.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the promotion without mutating state",
+    )
+    p_promote.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
 
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
@@ -873,7 +930,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         "complete": _cmd_complete,
         "edit":     _cmd_edit,
         "block":    _cmd_block,
+        "schedule": _cmd_schedule,
         "unblock":  _cmd_unblock,
+        "promote":  _cmd_promote,
         "archive":  _cmd_archive,
         "tail":     _cmd_tail,
         "dispatch": _cmd_dispatch,
@@ -1239,7 +1298,15 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
-    ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        branch_name = _parse_branch_flag(getattr(args, "branch", None))
+    except argparse.ArgumentTypeError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if branch_name and ws_kind != "worktree":
+        print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
+        return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1262,6 +1329,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
+            branch_name=branch_name,
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -1338,12 +1406,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             session_id=args.session,
             include_archived=args.archived,
-<<<<<<< HEAD
             order_by=getattr(args, "sort", None),
-=======
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
->>>>>>> 503702ea9 (kanban: filter tasks by workflow fields and runs by status/outcome)
         )
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
@@ -1441,6 +1506,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    if task.branch_name:
+        print(f"  branch:    {task.branch_name}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
@@ -1884,6 +1951,28 @@ def _cmd_block(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_schedule(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    failed: list[str] = []
+    with kb.connect() as conn:
+        for tid in ids:
+            if reason:
+                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
+            if not kb.schedule_task(
+                conn,
+                tid,
+                reason=reason,
+                expected_run_id=_worker_run_id_for(tid),
+            ):
+                failed.append(tid)
+                print(f"cannot schedule {tid}", file=sys.stderr)
+            else:
+                print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     if not ids:
@@ -1894,9 +1983,60 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         for tid in ids:
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked?)", file=sys.stderr)
+                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}")
+    return 0 if not failed else 1
+
+
+def _cmd_promote(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    extra_ids = list(getattr(args, "ids", None) or [])
+    # Dedupe while preserving order; positional task_id always first.
+    ids: list[str] = []
+    seen: set[str] = set()
+    for tid in [args.task_id, *extra_ids]:
+        if tid not in seen:
+            ids.append(tid)
+            seen.add(tid)
+
+    results: list[dict[str, object]] = []
+    with kb.connect() as conn:
+        for tid in ids:
+            ok, err = kb.promote_task(
+                conn,
+                tid,
+                actor=author,
+                reason=reason,
+                force=bool(args.force),
+                dry_run=bool(args.dry_run),
+            )
+            results.append({
+                "task_id": tid,
+                "promoted": ok,
+                "dry_run": bool(args.dry_run),
+                "forced": bool(args.force),
+                "reason": reason,
+                "error": err,
+            })
+
+    failed = [r for r in results if not r["promoted"]]
+    if as_json:
+        # Single-id stays a flat object for back-compat; bulk emits a list.
+        payload: object = results[0] if len(results) == 1 else results
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if not failed else 1
+
+    tag = " (dry)" if args.dry_run else ""
+    label = "Would promote" if args.dry_run else "Promoted"
+    for r in results:
+        if r["promoted"]:
+            suffix = f": {reason}" if reason else ""
+            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+        else:
+            print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
 
 
@@ -2195,7 +2335,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
@@ -2531,7 +2671,7 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done
-  `block <id> [reason]` Mark blocked; `unblock <id>` to revive
+  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
@@ -2579,6 +2719,15 @@ def run_slash(rest: str) -> str:
                 _choice.prog = f"/kanban {_name}"
                 _choice.exit_on_error = False  # type: ignore[attr-defined]
 
+    def _usage_for_error() -> str:
+        if tokens:
+            for _action in kanban_parser._actions:
+                if isinstance(_action, argparse._SubParsersAction):
+                    subparser = _action.choices.get(tokens[0])
+                    if subparser is not None:
+                        return subparser.format_usage().rstrip()
+        return kanban_parser.format_usage().rstrip()
+
     buf_out = io.StringIO()
     buf_err = io.StringIO()
     # ``-h`` / ``--help`` makes argparse print to stdout and SystemExit(0).
@@ -2596,7 +2745,7 @@ def run_slash(rest: str) -> str:
         body = err or out
         return f"⚠ /kanban usage error\n{body}" if body else "⚠ /kanban usage error"
     except argparse.ArgumentError as exc:
-        return f"⚠ /kanban usage error: {exc}"
+        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{exc}"
 
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:
